@@ -1,0 +1,431 @@
+\documentclass[letterpaper]{article}
+
+\usepackage[english]{babel}
+\usepackage[margin=.75in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{float}
+
+\bibliographystyle{ieeetr}
+
+\title{Team GLaDOS - Final Project}
+
+\author{Anton Samson, Brian Keung\\
+    \{ads8, bkeung\} @ sfu.ca}
+
+\date{December 3, 2014}
+
+\begin{document}
+\maketitle
+
+\section{Motivation}
+\indent \indent As our implementation of a stack decoder performed well on the task of French to English sentence translation, it was decided that the decoder implementation would also be performant in the task of Chinese to English sentence translation. After adapting the decoder to function with the toy dataset, efforts were made to improve the decoder and reduce overall runtime.
+\newline
+
+An attempt was also made to make use of our previous implementation of a Chinese language sentence segmenter, however, knowing that this approach would require generating new word alignments and a phrase table, this approach was abandoned due to time constraints. Focus was instead shifted on creating a feedback loop between the decoder and reranker.
+
+\section{Approach}
+
+\subsection{Decoder}
+
+\indent \indent The decoder was adapted to allow for the use of large amounts of data, better memory usage, and to allow for index offsets when dealing with chunked inputs. Many ease of life improvements were also made to the decoder in the form of various shell scripts and attempts at distributed computing.
+
+\subsubsection{Distortion Limit}
+
+\indent \indent A distortion limit was applied that allowed phrase re-orderings in a sentence up to a certain distance, \textit{d}. This limit determined the maximum number of words that could be skipped when generating hypotheses.
+\[allowable\:range = abs(index\:of\:last\:translated\:position - start\:position\:of\:current\:phrase) <= d\]
+
+\subsubsection{Phrase Retrieval}
+
+\indent \indent A new algorithm was written to retrieve untranslated phrases for use by the decoder. The coverage vector is first evaluated and the indices of untranslated slots are returned. These indices are then iterated over and any phrases that do not overlap with the current coverage vector are returned.
+
+\begin{algorithm}
+    \caption{Phrase Retrieval}\label{euclid}
+    \begin{algorithmic}[1]
+    \Function{GET\_PHRASES}{}
+    \State $untranslated \gets \text{list of indices in $h.coverage$ that are untranslated}$
+    \For{\textbf{each} value $start$ in $untranslated$}
+        \For{$j$ in $start$ to len(f)}
+            \For{$k$ in $j$+1 to len(f)+1}
+                \State $translated \gets \text{list of indices in $h.coverage[j:k]$ that are translated}$
+                \If {$translated\:==\:$0}
+                    \If {$f[j:k]\:in\:$tm}
+                        \State \text{yield $tm[f[j:k]]$, $j$, $k$}
+                    \EndIf
+                \EndIf
+            \EndFor
+        \EndFor
+    \EndFor
+    \EndFunction
+    \end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Top-N}
+
+\indent \indent The decoder allows for the pruning of the translation stacks by keeping only the top \textit{N} results as sorted by best log probability. However, it was observed that keeping more hypotheses resulted in better scores and that this form of pruning may inadvertently prune the best translation instead. Choosing a lower N allowed for greater speed in decoding but generally poorer scores while a greater N allowed for better scores but exponentially slower decoding.
+\newline
+
+The decoder can also output the top N values for each sentence to generate an n-best list.
+
+\subsubsection{Distortion Penalty}
+
+\indent \indent No penalty on distortion was applied in this decoder implementation as Chinese to English translations appeared to have many re-orderings at great distances. However, a new penalty formula was introduced but not used.
+
+\[distortion\:penalty = \log(penalty^{index\:of\:last\:translated\:position - start\:position\:of\:current\:phrase})\]
+
+\subsubsection{Future Cost Estimation (FCE)}
+
+\indent \indent As better translations may appear to be poor translations at the beginning of stack decoding, they are often pruned out when using Top-N and beam width. To better account for this, Future Cost Estimation was used to measure how expensive it would be to translate the rest of a sentence based off of the current hypothesis. By ordering the stacks by their FCE scores, the better hypotheses are ideally maintained.
+\newline
+
+Spans are created from left to right in a sentence and the highest translation model (TM) and language model (LM) scores are used to estimate the future costs. The FCE of the spans in a sentence are pre-computed and used to calculate the FCE of each hypothesis.
+
+\[adjusted\:score = future\:logprob + distortion\:penalty + local\:logprob - hypothesis_{logprob}\]
+
+The hypothesis adjusted score is also be added to the local adjusted score.
+\[adjusted\:score\:+= hypothesis_{adjusted\:score} - hypothesis_{future\:logprob}\]
+
+\subsubsection{Multiple Features and Weighting}
+
+\indent \indent The decoder's model was modified to accept more than one feature. Additionally, feature scores can be weighted by providing a weight file to the decoder.
+
+\[\mathbf{features} = \mathbf{feature\:list} \cdot \mathbf{weight\:list}\]
+
+\[model\:score = \sum\limits_{i=1}^{features} feature_i\]
+
+\subsection{Reranker}
+
+\indent \indent Features are dynamically added to the training data during runtime and include the estimated number of untranslated words in a translation and the difference in model score rank to bleu score rank.
+
+\subsubsection{Estimated Number of Untranslated Words}
+
+\indent \indent A set is created composed of the words in the source data. The source set is then intersected with the words in the translation candidate sentence and the count of these words is used as the score for the feature.
+\[untranslated = -1.0 \times (\vert Source\:Sentence \cap Translation\:Candidate\vert + 1)\]
+
+\subsubsection{Bleu Rank vs. Model Rank}
+
+\indent \indent A model score was calculated by summing over the features of a translation candidate. All of the translation candidates for a sentence were then ordered by their bleu score and the order of model scores compared. This was done in order to penalize candidates that have a large distance in terms of model rank and bleu rank. It was assumed that better candidates have a smaller difference in model and bleu rank.
+
+\begin{algorithm}
+    \caption{Bleu Rank vs. Model Rank}\label{euclid}
+    \begin{algorithmic}[1]
+    \Function{assign\_rank\_scores}{$nbests$}
+    \For{$nbest$ in $nbests$}
+        \State $bleu\_sorted \gets \text{sort by descending smoothed bleu score in $nbest$}$
+        \State $lm\_sorted \gets \text{sort by descending model score in $nbest$}$
+        \For{\textbf{each} index $i$ in $bleu\_sorted$}
+            \If {$bleu\_sorted[i]\:==\:$lm\_sorted[i]}
+                \State $bleu\_sorted[i].features \gets \text{\($bleu\_sorted[i]$.features + [-1.0]\)}$
+            \Else
+                \State $adjusted \gets \text{\(-1.0 \times (abs((i+1) - (index\:of\:$lm\_sorted$[i]\:in\:$bleu\_sorted$\:+\:1)) + 1)\)}$
+                \State $bleu\_sorted[i].features \gets \text{\($bleu\_sorted[i]$.features + [$adjusted$]\)}$
+            \EndIf
+        \EndFor
+    \EndFor
+    \State \text{return $nbests$}
+    \EndFunction
+    \end{algorithmic}
+\end{algorithm}
+
+\section{Data}
+
+\subsection{Toy Data}
+
+\indent \indent The toy dataset was used to adapt the decoder to work with multiple features and weighting.
+
+\begin{center}
+    \begin{tabular}{|r|l|}
+        \hline
+         & File\\
+        \hline
+        TM & /toy/phrase-table/phrase\_table.out\\
+        \hline
+        LM & /lm/en.tiny.3g.arpa\\
+        \hline
+        Input & /toy/train.cn\\
+        \hline
+        Reference & /toy/train.en\\
+        \hline
+    \end{tabular}
+\end{center}
+
+\subsection{Dev Data}
+
+\indent \indent The dev dataset was used to generate an n-best list and for training the reranker perceptron. The reference files were used to calculate bleu scores. The reference file was used to calculate bleu scores. The input file was split evenly, by line count, into four files for use by the decoder. These files are stored in the inputs folder.
+
+\begin{center}
+    \begin{tabular}{|r|l|}
+        \hline
+         & File\\
+        \hline
+        TM & /large/phrase-table/dev-filtered/rules\_cnt.final.out\\
+        \hline
+        LM & /lm/en.gigaword.3g.filtered.train\_dev\_test.arpa.gz\\
+        \hline
+        Input & /dev/all.cn-en.cn\\
+        \hline
+        Reference & /dev/all.cn-en.en0, /dev/all.cn-en.en1, /dev/all.cn-en.en2, /dev/all.cn-en.en3\\
+        \hline
+    \end{tabular}
+\end{center}
+
+\subsection{Test Data}
+
+\indent \indent The test dataset was used to generate a decoding from Chinese to English. The reference files were used to calculate bleu scores. The input file was split evenly, by line count, into four files for use by the decoder. These files are stored in the inputs folder.
+
+\begin{center}
+    \begin{tabular}{|r|l|}
+        \hline
+         & File\\
+        \hline
+        TM & /large/phrase-table/dev-filtered/rules\_cnt.final.out\\
+        \hline
+        LM & /lm/en.gigaword.3g.filtered.train\_dev\_test.arpa.gz\\
+        \hline
+        Input & /test/all.cn-en.cn\\
+        \hline
+        Reference & /test/all.cn-en.en0, /test/all.cn-en.en1, /test/all.cn-en.en2, /test/all.cn-en.en3\\
+        \hline
+    \end{tabular}
+\end{center}
+
+\section{Code}
+
+\indent \indent All of the code used in the final project was from homework 4 and 5.
+
+\begin{center}
+    \begin{tabular}{|l|l|}
+        \hline
+        Homework 4 & Homework 5\\
+        \hline
+        models.py & bleu.py\\
+        \hline
+        decoder.py & score-reranker.py\\
+        \hline
+         & get-weights.py\\
+        \hline
+    \end{tabular}
+\end{center}
+
+Several shell scripts were written to generate decodings, n-best lists, weights, and scores. These include and should be run in this order: \textit{nbest.sh}, \textit{rerank.sh}, and \textit{score.sh}.
+
+\section{Experimental Setup}
+
+\subsection{Setup: Feedback Loop}
+
+\begin{enumerate}
+    \item Split the input file into \(2^n, n \ge 0\), files to reduce decoder runtime.
+    \item Generate an n-best list using the input files. Join the n-best lists into a single file.
+    \item Generate weights using the joined n-best list.
+    \item Run the decoder using the weights and split input files. Join the outputs.
+    \item Run the previous output through the score program.
+\end{enumerate}
+
+\subsection{Setup: Decoder Only}
+
+\begin{enumerate}
+    \item Split the input file into \(2^n, n \ge 0\), files to reduce decoder runtime.
+    \item Run the decoder using the default weights and split input files. Join the outputs.
+    \item Run the previous output through the score program.
+\end{enumerate}
+
+\subsection{Evaluation}
+
+\begin{enumerate}
+    \item The bleu score was used to evaluate the machine translation system.
+    \item The occurrences of n-grams of size 1 to 4 were counted and sentences that were shorter than the reference sentence penalized.
+    \item Four references were used instead of one to improve the n-gram precision.
+    \item Different parameters such as distortion limit and number of translations per phrase were used and their scores compared.
+\end{enumerate}
+
+\section{Results}
+
+\subsection{Dev Data}
+
+When evaluating over a single reference, \textit{/dev/all.cn-en.en0} was used.
+
+\subsubsection{First 100 Sentences, No Reranking}
+\begin{center}
+  \begin{tabularx}{0.95\textwidth}{| X | X | X | X | X |}
+  \hline
+  Max. Stack Size & Distortion Limit & Max. Translations & Bleu Score (4 refs) \\
+  \hline
+  100 & 1 & 10 & 0.16673775\\
+  \hline
+  100 & 3 & 10 & 0.148131408563\\
+  \hline
+  \end{tabularx}
+\end{center}
+
+\subsubsection{First 100 Sentences, No Reranking}
+\begin{center}
+  \begin{tabularx}{0.95\textwidth}{| X | X | X | X | X |}
+  \hline
+  Max. Stack Size & Distortion Limit & Max. Translations & Bleu Score (4 refs) & Bleu Score (1 ref) \\
+  \hline
+  100 & 1 & 5 & 0.16751394 & 0.110099834726\\
+  \hline
+  100 & 2 & 5 & 0.15719862 & 0.10400971324\\
+  \hline
+  100 & 3 & 5 & 0.15798428 & 0.104612493422\\
+  \hline
+  100 & 4 & 5 & 0.15312168 & 0.10046669526\\
+  \hline
+  100 & 5 & 5 & 0.15390518 & 0.0991379823101\\
+  \hline
+  100 & 6 & 5 & 0.14549784 & 0.0935341263432\\
+  \hline
+  \end{tabularx}
+\end{center}
+
+\subsubsection{Over All Sentences, No Reranking}
+\begin{center}
+  \begin{tabularx}{0.95\textwidth}{| X | X | X | X | X |}
+  \hline
+  Max. Stack Size & Distortion Limit & Max. Translations & Bleu Score (4 refs) & Bleu Score (1 ref) \\
+  \hline
+  100 & 1 & 5 & 0.13619778 & 0.0800299414496\\
+  \hline
+  100 & 3 & 5 & 0.12116937 & 0.0713563447896\\
+  \hline
+  100 & 4 & 5 & 0.11855773 & 0.0693950240411\\
+  \hline
+  100 & 5 & 5 & 0.11844958 & 0.0690408722579\\
+  \hline
+  \end{tabularx}
+\end{center}
+
+\subsection{Test Data}
+
+The stack size used for all tests was 100. When evaluating over a single reference, \textit{/test/all.cn-en.en0} was used.
+
+\subsubsection{First 100 Sentences, Reranking}
+
+Reranking generated bleu scores in the range of 0.08326205 to 0.12005043 over 4 references when distortion limit, d, is 1 and translations per sentence, \textit{k}, is 5.
+
+\subsubsection{Over All Sentences, No Reranking}
+
+\begin{center}
+  \begin{tabularx}{0.95\textwidth}{| X | X | X | X | X |}
+  \hline
+  Max. Stack Size & Distortion Limit & Max. Translations & Bleu Score (4 refs) & Bleu Score (1 ref) \\
+  \hline
+  100 & 1 & 5 & 0.12870545 & 0.0762740411297\\
+  \hline
+  100 & 3 & 5 & 0.12077389 & 0.070930367351\\
+  \hline
+  100 & 5 & 5 & 0.12009749 & 0.0714391721834\\
+  \hline
+  \end{tabularx}
+\end{center}
+
+\section{Analysis of the Results}
+
+\subsection{Observations}
+
+\begin{enumerate}
+    \item Scoring over a greater number of sentences gives a lower score. This may be due to longer sentences being penalized or the possibility of more unknown words.
+    \item When d, distortion limit, is greater than 1, scores received seem to be trending downwards. This is unexpected behaviour as if we allow words to swap at a bigger distance, it should improve Chinese to English accuracy. Knowing that the sentence structure for Chinese and English are generally reversed, we tried to remove the penalty for distortion but ended up still getting a lower score compared to when d is set to 1. This may be due to a bug in our code or the way we are evaluating the test data.
+    \item Reranking appears to lower bleu scores using our current implementation and data.
+\end{enumerate}
+
+\subsection{Improvements over Baseline}
+
+\indent \indent As the baseline score was around 0.06 bleu, the use of FCE, stack decoding, and distortion limits increased the bleu score to 0.1287 when d is set to 1.
+
+\section{Future Work}
+\begin{enumerate}
+    \item Investigate issues in the distortion limit code or related.
+    \item Tweak the ratio of TM and LM scores.
+    \item Use our own Chinese word segmenter.
+    \item Use of other weighting heuristics would likely help to improve the overall runtime and translation scores of this decoder.
+    \item Use of additional features, perhaps involving the number of words or IBM Model 1 alignments, may help to improve the reranking score. These along with the process of Minimum Bayes Risk and Ordinal Regression should be explored.
+\end{enumerate}
+\newpage
+
+\section{Usage}
+
+\textbf{NOTE:} Some of the paths used in the shell scripts may need to be changed to function correctly.
+
+\subsection{Distributed}
+
+To generate an n-best list using input chunk file 01 and an index offset of 482:
+\begin{lstlisting}[frame=single]
+./nbest.sh 01 482
+\end{lstlisting}
+
+\noindent To generate translations using input chunk file 02:
+\begin{lstlisting}[frame=single]
+./fast.sh 02
+\end{lstlisting}
+
+\noindent To generate 10 weights from an n-best file and store them in weights folder 3:
+\begin{lstlisting}[frame=single]
+./rerank.sh 3 /path/to/some.nbest 10
+\end{lstlisting}
+
+\noindent To decode using the weights from weight folder 3:
+\begin{lstlisting}[frame=single]
+./score.sh 3
+\end{lstlisting}
+
+\subsection{Single Computer}
+
+To view all of the available options:
+\begin{lstlisting}[frame=single]
+python decoder.py -h
+python get-weights.py -h
+python score-reranker.py -h
+\end{lstlisting}
+
+\noindent To generate a n-best list, n is 100 in this example, in one pass:
+\begin{lstlisting}[frame=single]
+python decoder.py -s 100 -v -a
+\end{lstlisting}
+
+\noindent To decode with with a maximum of 100 hypotheses per stack, a distortion limit of 10, and limit the number of translations to 20:
+\begin{lstlisting}[frame=single]
+python decoder.py -s 100 -d 10 -k 20 -v
+\end{lstlisting}
+
+\noindent To specify your own input file, translation model, and language model:
+\begin{lstlisting}[frame=single]
+python decoder.py -i /path/to/input.file -t /path/to/tm -l /path/to/lm
+\end{lstlisting}
+
+\noindent To specify your own weights file:
+\begin{lstlisting}[frame=single]
+python decoder.py -w /path/to/weights.file
+\end{lstlisting}
+
+\noindent To generate weights using the default values and an n-best file \textit{data/train.nbest}, target language file \textit{data/train.en}, and source language file \textit{data/train.fr}:
+\begin{lstlisting}[frame=single]
+python get-weights.py -n data/train.nbest -e data/train.en -f data/train.fr
+\end{lstlisting}
+
+\noindent To generate weights using the default training data, generate 5,000 random samples while using only 100 of them, set the cutoff for the sampler to 0.21, over 5 perceptron iterations with a learning rate of 0.1:
+\begin{lstlisting}[frame=single]
+python get-weights.py -t 5000 -a 0.21 -x 100 -r 0.1 -i 5
+\end{lstlisting}
+
+\noindent To score output file of the first 100 sentences, not an n-best list, from the decoder:
+\begin{lstlisting}[frame=single]
+python score-reranker.py -r /path/to/reference.file -n 100 < /path/to/output.file
+\end{lstlisting}
+
+\noindent To score the an output file, not an n-best list, from the decoder:
+\begin{lstlisting}[frame=single]
+python score-reranker.py -r /path/to/reference.file < /path/to/output.file
+\end{lstlisting}
+
+\end{document}
+
+
+
