@@ -1,4 +1,4 @@
-# 2014 CMPT 413 Homework and Project Archive
+# 2014 CMPT 413/825 Homework and Project Archive
 
 These are some of the homework assignments and the final project I completed in 2014's Natural Language Processing class taught by Dr. Anoop Sarkar at Simon Fraser University.
 
